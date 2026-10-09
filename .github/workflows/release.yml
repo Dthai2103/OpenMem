@@ -102,7 +102,7 @@ jobs:
       actions: read
     steps:
     - name: Download all the dists (Same Run)
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@v7
       with:
         pattern: python-package-distributions-*
         path: dist/
@@ -137,7 +137,7 @@ jobs:
       actions: read
     steps:
     - name: Download all the dists (Same Run)
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@v7
       with:
         pattern: python-package-distributions-*
         path: dist/
