@@ -45,7 +45,7 @@ jobs:
         working-directory: ${{ matrix.directory }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Queued runs package current main, never an older event snapshot.
           ref: main

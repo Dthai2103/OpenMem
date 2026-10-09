@@ -29,12 +29,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Check out the reviewed Hermes test host
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: NousResearch/hermes-agent
           ref: 5bba024d8ddd388f56f354c1f789be825e3d8a3c
@@ -110,10 +110,10 @@ jobs:
         shell: bash
         working-directory: .ci/hermes-agent
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: NousResearch/hermes-agent
           ref: ${{ matrix.hermes_ref || '5bba024d8ddd388f56f354c1f789be825e3d8a3c' }}
