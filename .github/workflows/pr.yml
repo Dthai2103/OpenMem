@@ -28,7 +28,7 @@ jobs:
         examples/memory-plugin-shared/install-agent-hooks.test.mjs
         examples/memory-plugin-shared/release-marketplace.test.mjs
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
@@ -92,7 +92,7 @@ jobs:
       run:
         working-directory: examples/openclaw-plugin
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v6
         with:
@@ -121,7 +121,7 @@ jobs:
     runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'pull_request' }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -143,7 +143,7 @@ jobs:
       openclaw_changed: ${{ steps.check.outputs.openclaw_changed }}
       sdk_python_changed: ${{ steps.check.outputs.sdk_python_changed }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -231,7 +231,7 @@ jobs:
       matrix:
         python-version: ["3.8", "3.9", "3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -277,7 +277,7 @@ jobs:
       matrix:
         python-version: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
