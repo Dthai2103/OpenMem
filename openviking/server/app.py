@@ -785,9 +785,8 @@ def create_app(
     else:
         logger.info("Web Studio bundle not found at %s; skipping /studio mount", _studio_dir)
 
-    # MCP endpoint — serves 16 tools (find, search, read, write, edit,
-    # list, tree, remember, add_resource, add_skill, list_watches, cancel_watch,
-    # grep, glob, forget, health) via streamable HTTP for MCP clients.
+    # MCP endpoint — serves retrieval, filesystem, memory, resources, skills,
+    # watches, ACL, and workspace-memory tools via streamable HTTP for MCP clients.
     from starlette.routing import Match, Route
 
     from openviking.server.mcp_endpoint import create_mcp_app

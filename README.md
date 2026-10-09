@@ -157,6 +157,47 @@ uv tool install openviking --upgrade && openviking-server init
 
 </details>
 
+<details open>
+<summary><strong>Run this source checkout</strong></summary>
+
+Use this path when you are working from this customized source tree instead of
+the published `openviking` package.
+
+```bash
+git clone https://github.com/Dthai2103/OpenMem.git
+cd OpenMem
+uv sync
+uv run openviking-server init
+uv run openviking-server doctor
+uv run openviking-server
+```
+
+`openviking-server init` writes the server config to `~/.openviking/ov.conf`.
+Choose the model provider during the wizard. For a fully local setup, select
+Ollama and make sure Ollama is running before `doctor`:
+
+```bash
+ollama serve
+```
+
+When the server is running, verify it from another terminal:
+
+```bash
+curl http://127.0.0.1:1933/health
+```
+
+If you want another machine to connect, bind the server to `0.0.0.0` during
+`init`, keep port `1933` reachable on the network, and connect clients to:
+
+```text
+http://<OPENVIKING_MACHINE_IP>:1933/mcp
+```
+
+After changing source code, restart `uv run openviking-server`; the running
+server does not hot-reload Python source changes.
+
+</details>
+
 <details>
 <summary><strong>Use OpenViking Service (hosted by Volcengine)</strong></summary>
 

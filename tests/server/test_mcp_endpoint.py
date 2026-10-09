@@ -24,10 +24,12 @@ from openviking.server.dependencies import set_service
 from openviking.server.identity import AuthMode, RequestContext, Role
 from openviking.server.mcp_endpoint import (
     StoreMessage,
+    WorkspaceSessionMessage,
     _get_ctx,
     _IdentityASGIMiddleware,
     _mcp_ctx,
     _resolve_mcp_workspace_uri,
+    _workspace_native_peer_id,
     add_resource,
     add_skill,
     cancel_watch,
@@ -41,6 +43,10 @@ from openviking.server.mcp_endpoint import (
     remember,
     search,
     tree,
+    workspace_context,
+    workspace_memory_search,
+    workspace_memory_write,
+    workspace_session_commit,
     write,
 )
 from openviking.server.mcp_endpoint import ls as list_tool
@@ -1947,6 +1953,345 @@ async def test_forget_rejects_namespace_roots_for_non_root(
         _mcp_ctx.reset(token)
 
     assert (await service.viking_fs.read(sentinel_uri, ctx=ctx)).decode("utf-8") == "must survive"
+
+
+# ---------------------------------------------------------------------------
+# workspace memory tools
+# ---------------------------------------------------------------------------
+
+
+async def test_workspace_memory_write_creates_scoped_markdown(service, monkeypatch):
+    captured = {}
+
+    async def fake_write(**kwargs):
+        captured.update(kwargs)
+        return {
+            "uri": kwargs["uri"],
+            "written_bytes": len(kwargs["content"]),
+            "semantic_status": "queued",
+            "vector_status": "queued",
+        }
+
+    monkeypatch.setattr(service.fs, "write", fake_write)
+
+    result = await workspace_memory_write(
+        workspace_id="default",
+        project_id="openviking-librefang",
+        scope="user",
+        user_id="dthai",
+        memory_type="preference",
+        title="Use MCP for OpenViking",
+        content="LibreFang should call OpenViking through MCP for durable memory.",
+        tags=["mcp", "memory"],
+        wait=True,
+    )
+
+    assert result["status"] == "ok"
+    assert result["scope"] == "user"
+    assert result["memory_type"] == "preference"
+    assert result["uri"].startswith(
+        "viking://user/test_user/workspaces/default/projects/openviking-librefang/"
+        "memories/users/dthai/use-mcp-for-openviking-"
+    )
+    assert captured["mode"] == "create"
+    assert captured["wait"] is True
+    assert 'workspace_id: "default"' in captured["content"]
+    assert 'project_id: "openviking-librefang"' in captured["content"]
+    assert 'scope: "user"' in captured["content"]
+    assert 'memory_type: "preference"' in captured["content"]
+    assert 'user_id: "dthai"' in captured["content"]
+    assert '  - "mcp"' in captured["content"]
+    assert "LibreFang should call OpenViking" in captured["content"]
+
+
+async def test_workspace_memory_write_validates_scope_owner():
+    with pytest.raises(InvalidArgumentError, match="user_id is required"):
+        await workspace_memory_write(
+            workspace_id="default",
+            project_id="project",
+            scope="user",
+            content="User-specific fact.",
+        )
+    with pytest.raises(InvalidArgumentError, match="agent_id is required"):
+        await workspace_memory_write(
+            workspace_id="default",
+            project_id="project",
+            scope="agent",
+            content="Agent-specific lesson.",
+        )
+
+
+async def test_workspace_memory_write_validates_memory_type():
+    with pytest.raises(InvalidArgumentError, match="memory_type"):
+        await workspace_memory_write(
+            workspace_id="default",
+            project_id="project",
+            scope="project",
+            memory_type="temporary",
+            content="Transient note.",
+        )
+
+
+async def test_workspace_memory_write_rejects_secret_like_content():
+    with pytest.raises(InvalidArgumentError, match="secret"):
+        await workspace_memory_write(
+            workspace_id="default",
+            project_id="project",
+            scope="project",
+            content="api_key = abc123",
+        )
+
+
+async def test_workspace_memory_search_scopes_target_uri(service, monkeypatch):
+    captured = {}
+
+    async def fake_find(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            memories=[
+                SimpleNamespace(
+                    uri="viking://user/test_user/workspaces/default/projects/p/memories/project/a.md",
+                    abstract="Architecture decision",
+                    score=0.75,
+                )
+            ],
+            resources=[],
+            skills=[],
+        )
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    result = await workspace_memory_search(
+        workspace_id="default",
+        project_id="p",
+        query="architecture",
+        scope="project",
+        limit=4,
+        min_score=0.2,
+    )
+
+    assert captured["target_uri"] == (
+        "viking://user/test_user/workspaces/default/projects/p/memories/project"
+    )
+    assert captured["limit"] == 4
+    assert captured["score_threshold"] == 0.2
+    assert captured["filter"] == {"op": "must", "field": "context_type", "conds": ["resource"]}
+    assert result["items"][0]["type"] == "memory"
+    assert result["items"][0]["uri"].endswith("/a.md")
+
+
+async def test_workspace_memory_search_detail_levels(service, monkeypatch):
+    async def fake_find(**kwargs):
+        return SimpleNamespace(
+            memories=[
+                SimpleNamespace(
+                    uri="viking://user/test_user/workspaces/default/projects/p/memories/project/a.md",
+                    abstract="L0 abstract",
+                    score=0.75,
+                )
+            ],
+            resources=[],
+            skills=[],
+        )
+
+    async def fake_overview(uri, ctx):
+        return "L1 overview"
+
+    async def fake_read_visible(uri, ctx):
+        return "L2 full content"
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+    monkeypatch.setattr(service.fs, "overview", fake_overview)
+    monkeypatch.setattr(service.fs, "read_visible", fake_read_visible)
+
+    overview = await workspace_memory_search(
+        workspace_id="default",
+        project_id="p",
+        query="architecture",
+        detail="overview",
+    )
+    full = await workspace_memory_search(
+        workspace_id="default",
+        project_id="p",
+        query="architecture",
+        detail="full",
+    )
+
+    assert overview["detail"] == "overview"
+    assert overview["items"][0]["abstract"] == "L0 abstract"
+    assert overview["items"][0]["overview"] == "L1 overview"
+    assert "content" not in overview["items"][0]
+    assert full["detail"] == "full"
+    assert full["items"][0]["content"] == "L2 full content"
+
+
+async def test_workspace_context_returns_librefang_buckets(service, monkeypatch):
+    seen_targets = []
+
+    async def fake_find(**kwargs):
+        seen_targets.append(kwargs["target_uri"])
+        target = kwargs["target_uri"]
+        item = SimpleNamespace(uri=f"{target}/hit.md", abstract=f"hit for {target}", score=0.8)
+        if target.endswith("/resources"):
+            return SimpleNamespace(memories=[], resources=[item], skills=[])
+        if target.endswith("/skills"):
+            return SimpleNamespace(memories=[], resources=[item], skills=[])
+        return SimpleNamespace(memories=[item], resources=[], skills=[])
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    result = await workspace_context(
+        workspace_id="default",
+        project_id="p",
+        query="what matters for this task",
+        user_id="dthai",
+        agent_id="librefang",
+        project_limit=1,
+        user_limit=1,
+        agent_limit=1,
+        resource_limit=1,
+        skill_limit=1,
+    )
+
+    assert result["roots"]["project"] == "viking://user/test_user/workspaces/default/projects/p"
+    assert len(result["project_memories"]) == 1
+    assert len(result["user_memories"]) == 1
+    assert len(result["agent_memories"]) == 1
+    assert len(result["resources"]) == 1
+    assert len(result["skills"]) == 1
+    assert (
+        "viking://user/test_user/workspaces/default/projects/p/memories/users/dthai"
+        in seen_targets
+    )
+    assert (
+        "viking://user/test_user/workspaces/default/projects/p/memories/agents/librefang"
+        in seen_targets
+    )
+
+
+def test_workspace_native_peer_id_maps_workspace_project():
+    assert _workspace_native_peer_id(
+        "default",
+        "openviking-librefang",
+        company_id="librefang",
+    ) == "company-librefang__workspace-default__project-openviking-librefang"
+
+
+async def test_workspace_session_commit_uses_native_session_with_peer_policy(service, monkeypatch):
+    captured = {
+        "created": None,
+        "messages": None,
+        "commit": None,
+    }
+
+    class FakeSession:
+        async def add_messages_async(self, messages_spec):
+            captured["messages"] = messages_spec
+
+    async def fake_create(ctx, session_id=None, memory_policy=None, event_tags=None, **kwargs):
+        captured["created"] = {
+            "ctx": ctx,
+            "session_id": session_id,
+            "memory_policy": memory_policy,
+            "event_tags": event_tags,
+        }
+        return FakeSession()
+
+    async def fake_commit_async(session_id, ctx, keep_recent_count=0, event_tags=None, **kwargs):
+        captured["commit"] = {
+            "session_id": session_id,
+            "ctx": ctx,
+            "keep_recent_count": keep_recent_count,
+            "event_tags": event_tags,
+        }
+        return {"session_id": session_id, "status": "queued", "task_id": "task-native"}
+
+    monkeypatch.setattr(service.sessions, "create", fake_create)
+    monkeypatch.setattr(service.sessions, "commit_async", fake_commit_async)
+
+    result = await workspace_session_commit(
+        workspace_id="default",
+        project_id="openviking-librefang",
+        company_id="librefang",
+        session_id="lf-task-1",
+        user_id="u1",
+        agent_id="codex",
+        task_id="task-1",
+        messages=[
+            WorkspaceSessionMessage(
+                role="user",
+                content="Please implement the OpenViking MCP memory bridge.",
+                message_kind="user_query",
+            ),
+            WorkspaceSessionMessage(
+                role="assistant",
+                content="Implemented and verified.",
+                message_kind="assistant_step",
+            ),
+        ],
+        task_history={"status": "success", "files_changed": ["openviking/server/mcp_endpoint.py"]},
+        keep_recent_count=1,
+    )
+
+    peer_id = "company-librefang__workspace-default__project-openviking-librefang"
+    assert result["status"] == "ok"
+    assert result["peer_id"] == peer_id
+    assert result["native_roots"]["project_peer_memories"] == (
+        f"viking://user/test_user/peers/{peer_id}/memories"
+    )
+    assert captured["created"]["memory_policy"] == {
+        "self": {"enabled": True},
+        "peer": {"enabled": True},
+    }
+    assert captured["created"]["event_tags"] == [
+        "workspace_id=default",
+        "project_id=openviking-librefang",
+        "source=librefang",
+        "company_id=librefang",
+        "user_id=u1",
+        "agent_id=codex",
+        "task_id=task-1",
+    ]
+    assert len(captured["messages"]) == 3
+    assert captured["messages"][0]["peer_id"] == peer_id
+    assert captured["messages"][0]["message_kind"] == "user_query"
+    assert "LibreFang task history" in captured["messages"][2]["parts"][0].text
+    assert captured["commit"]["keep_recent_count"] == 1
+
+
+async def test_workspace_context_can_include_native_buckets(service, monkeypatch):
+    seen_targets = []
+
+    async def fake_find(**kwargs):
+        seen_targets.append(kwargs["target_uri"])
+        target = kwargs["target_uri"]
+        item = SimpleNamespace(uri=f"{target}/hit.md", abstract=f"hit for {target}", score=0.8)
+        return SimpleNamespace(memories=[item], resources=[], skills=[])
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    result = await workspace_context(
+        workspace_id="default",
+        project_id="openviking-librefang",
+        company_id="librefang",
+        query="reuse project lessons",
+        project_limit=0,
+        user_limit=0,
+        agent_limit=0,
+        resource_limit=0,
+        skill_limit=0,
+        native_limit=1,
+        include_native=True,
+    )
+
+    peer_id = "company-librefang__workspace-default__project-openviking-librefang"
+    assert result["native"] == {"enabled": True, "peer_id": peer_id}
+    assert len(result["native_project_memories"]) == 1
+    assert len(result["native_user_memories"]) == 1
+    assert len(result["native_experiences"]) == 1
+    assert f"viking://user/test_user/peers/{peer_id}/memories" in seen_targets
+    assert "viking://user/test_user/memories" in seen_targets
+    assert "viking://user/test_user/memories/experiences" in seen_targets
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import base64
 import contextvars
+import hashlib
+import json
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import wraps
@@ -89,6 +92,7 @@ from openviking.utils.search_filters import (
 from openviking.utils.skill_processor import SkillProcessor
 from openviking.utils.time_decay import validate_event_time_decay_request
 from openviking_cli.exceptions import (
+    AlreadyExistsError,
     InvalidArgumentError,
     NotFoundError,
     OpenVikingError,
@@ -442,6 +446,252 @@ def _resolve_context_type_filter(
         return merge_search_filter(None, context_type=context_type)
     except ValueError as exc:
         raise InvalidArgumentError(str(exc)) from exc
+
+
+_WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_WORKSPACE_SCOPE_REQUIRES_OWNER = {
+    "project": None,
+    "user": "user_id",
+    "agent": "agent_id",
+}
+_WORKSPACE_MEMORY_TYPES = frozenset(
+    {
+        "fact",
+        "decision",
+        "preference",
+        "instruction",
+        "experience",
+        "reflection",
+    }
+)
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|secret|password|private[_-]?key)\b\s*[:=]"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+)
+
+
+def _validate_workspace_segment(value: str, field_name: str) -> str:
+    value = (value or "").strip()
+    if not _WORKSPACE_ID_RE.fullmatch(value):
+        raise InvalidArgumentError(
+            f"{field_name} must match {_WORKSPACE_ID_RE.pattern} "
+            "(letters, digits, '_' or '-', max 64 chars, starting with a letter or digit)"
+        )
+    return value
+
+
+def _workspace_project_root(workspace_id: str, project_id: str) -> str:
+    workspace = _validate_workspace_segment(workspace_id, "workspace_id")
+    project = _validate_workspace_segment(project_id, "project_id")
+    return f"viking://~/workspaces/{workspace}/projects/{project}"
+
+
+def _workspace_memory_dir(
+    workspace_id: str,
+    project_id: str,
+    scope: Literal["project", "user", "agent"],
+    *,
+    user_id: str = "",
+    agent_id: str = "",
+) -> str:
+    root = _workspace_project_root(workspace_id, project_id)
+    if scope == "project":
+        return f"{root}/memories/project"
+    if scope == "user":
+        owner = _validate_workspace_segment(user_id, "user_id")
+        return f"{root}/memories/users/{owner}"
+    if scope == "agent":
+        owner = _validate_workspace_segment(agent_id, "agent_id")
+        return f"{root}/memories/agents/{owner}"
+    raise InvalidArgumentError("scope must be one of: project, user, agent")
+
+
+def _workspace_resource_dir(workspace_id: str, project_id: str) -> str:
+    return f"{_workspace_project_root(workspace_id, project_id)}/resources"
+
+
+def _workspace_skill_dir(workspace_id: str, project_id: str) -> str:
+    return f"{_workspace_project_root(workspace_id, project_id)}/skills"
+
+
+def _workspace_native_peer_id(
+    workspace_id: str,
+    project_id: str,
+    *,
+    company_id: str = "",
+) -> str:
+    """Map one LibreFang workspace/project to a native OpenViking peer id."""
+    workspace = _validate_workspace_segment(workspace_id, "workspace_id")
+    project = _validate_workspace_segment(project_id, "project_id")
+    parts = []
+    if company_id.strip():
+        parts.append(f"company-{_validate_workspace_segment(company_id, 'company_id')}")
+    parts.extend([f"workspace-{workspace}", f"project-{project}"])
+    return "__".join(parts)
+
+
+def _workspace_native_peer_memory_root(
+    workspace_id: str,
+    project_id: str,
+    *,
+    company_id: str = "",
+) -> str:
+    peer_id = _workspace_native_peer_id(workspace_id, project_id, company_id=company_id)
+    return f"viking://~/peers/{peer_id}/memories"
+
+
+def _workspace_event_tags(
+    *,
+    workspace_id: str,
+    project_id: str,
+    company_id: str = "",
+    user_id: str = "",
+    agent_id: str = "",
+    task_id: str = "",
+) -> List[str]:
+    tags = [
+        f"workspace_id={workspace_id}",
+        f"project_id={project_id}",
+        "source=librefang",
+    ]
+    if company_id:
+        tags.append(f"company_id={company_id}")
+    if user_id:
+        tags.append(f"user_id={user_id}")
+    if agent_id:
+        tags.append(f"agent_id={agent_id}")
+    if task_id:
+        tags.append(f"task_id={task_id}")
+    return tags
+
+
+def _slugify_memory_title(title: str, content: str) -> str:
+    if title.strip():
+        source = title.strip()
+    elif content.strip():
+        source = content.strip().splitlines()[0][:80]
+    else:
+        source = "memory"
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", source.lower()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)[:48].strip("-") or "memory"
+    digest = hashlib.sha1(content.encode("utf-8")).hexdigest()[:10]
+    return f"{slug}-{digest}"
+
+
+def _frontmatter_scalar(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _workspace_memory_document(
+    *,
+    workspace_id: str,
+    project_id: str,
+    scope: str,
+    memory_type: str,
+    title: str,
+    content: str,
+    tags: Optional[List[str]],
+    user_id: str = "",
+    agent_id: str = "",
+) -> str:
+    now = datetime.now(timezone.utc).isoformat()
+    lines = [
+        "---",
+        f"workspace_id: {_frontmatter_scalar(workspace_id)}",
+        f"project_id: {_frontmatter_scalar(project_id)}",
+        f"scope: {_frontmatter_scalar(scope)}",
+        f"memory_type: {_frontmatter_scalar(memory_type)}",
+        f"title: {_frontmatter_scalar(title.strip() or 'Untitled memory')}",
+    ]
+    if user_id:
+        lines.append(f"user_id: {_frontmatter_scalar(user_id)}")
+    if agent_id:
+        lines.append(f"agent_id: {_frontmatter_scalar(agent_id)}")
+    if tags:
+        lines.append("tags:")
+        for tag in tags:
+            tag = str(tag).strip()
+            if tag:
+                lines.append(f"  - {_frontmatter_scalar(tag)}")
+    lines.extend(
+        [
+            f"created_at: {_frontmatter_scalar(now)}",
+            f"updated_at: {_frontmatter_scalar(now)}",
+            "---",
+            "",
+            content.strip(),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _reject_secret_like_memory(content: str) -> None:
+    if any(pattern.search(content or "") for pattern in _SECRET_PATTERNS):
+        raise InvalidArgumentError(
+            "content looks like it may contain a secret. Refuse to store it in workspace memory."
+        )
+
+
+def _validate_workspace_memory_type(memory_type: str) -> str:
+    memory_type = (memory_type or "").strip().lower()
+    if memory_type not in _WORKSPACE_MEMORY_TYPES:
+        allowed = ", ".join(sorted(_WORKSPACE_MEMORY_TYPES))
+        raise InvalidArgumentError(f"memory_type must be one of: {allowed}")
+    return memory_type
+
+
+def _context_items(result, *, force_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for ctx_type, contexts in [
+        ("memory", result.memories),
+        ("resource", result.resources),
+        ("skill", result.skills),
+    ]:
+        for item in contexts:
+            items.append(
+                {
+                    "type": force_type or ctx_type,
+                    "uri": _hit_uri(ctx_type, item.uri),
+                    "hit_uri": item.uri,
+                    "score": getattr(item, "score", 0.0),
+                    "abstract": getattr(item, "abstract", "") or getattr(item, "overview", ""),
+                }
+            )
+    return items
+
+
+async def _apply_context_detail(
+    items: List[Dict[str, Any]],
+    *,
+    service,
+    ctx: RequestContext,
+    detail: Literal["abstract", "overview", "full"],
+) -> None:
+    if detail == "abstract" or not items:
+        return
+
+    import asyncio
+
+    semaphore = asyncio.Semaphore(10)
+
+    async def _load(item: Dict[str, Any]) -> None:
+        uri = item["uri"]
+        async with semaphore:
+            if detail == "overview":
+                try:
+                    item["overview"] = await service.fs.overview(uri, ctx=ctx)
+                except Exception:
+                    item["overview"] = item.get("abstract") or ""
+                return
+            try:
+                item["content"] = await service.fs.read_visible(uri, ctx=ctx)
+            except Exception:
+                item["content"] = None
+
+    await asyncio.gather(*(_load(item) for item in items))
 
 
 @_mcp_error_results()
@@ -1161,6 +1411,25 @@ class StoreMessage(BaseModel):
     content: str = Field(description="Message text content")
 
 
+class WorkspaceSessionMessage(BaseModel):
+    role: Literal["user", "assistant"] = Field(description="Conversation message role")
+    content: str = Field(description="Message text content")
+    created_at: Optional[str] = Field(
+        default=None,
+        description="Optional ISO timestamp from the source runtime",
+    )
+    turn_id: Optional[str] = Field(
+        default=None,
+        description="Optional source turn id used to group related messages",
+    )
+    message_kind: Optional[
+        Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
+    ] = Field(
+        default=None,
+        description="Optional native OpenViking message kind hint",
+    )
+
+
 @_mcp_error_results()
 @mcp.tool(annotations=_DESTRUCTIVE_TOOL_ANNOTATIONS)
 async def remember(messages: list[StoreMessage]) -> str:
@@ -1182,6 +1451,491 @@ async def remember(messages: list[StoreMessage]) -> str:
                 session.add_message(msg.role, [TextPart(text=msg.content)])
     await service.sessions.commit_async(session_id, ctx)
     return f"Stored {len(messages)} message(s) and committed for memory extraction."
+
+
+# -- workspace memory ------------------------------------------------------
+
+
+@_mcp_error_results()
+@mcp.tool(annotations=_DESTRUCTIVE_TOOL_ANNOTATIONS)
+async def workspace_memory_write(
+    workspace_id: str,
+    project_id: str,
+    scope: Literal["project", "user", "agent"],
+    content: str,
+    memory_type: Literal[
+        "fact", "decision", "preference", "instruction", "experience", "reflection"
+    ] = "fact",
+    title: str = "",
+    user_id: str = "",
+    agent_id: str = "",
+    tags: Optional[List[str]] = None,
+    wait: bool = False,
+    timeout: Optional[float] = None,
+) -> dict[str, Any]:
+    """Write a durable workspace/project memory for MCP agents such as LibreFang.
+
+    Memories are stored under the caller's private workspace root:
+    ``viking://~/workspaces/{workspace_id}/projects/{project_id}/memories``.
+    Use ``scope="project"`` for project decisions and facts, ``scope="user"``
+    for one user's stable preferences in the project, and ``scope="agent"`` for
+    reusable agent workflow lessons. ``memory_type`` classifies what kind of L2
+    memory is being stored; OpenViking derives L0/L1 retrieval views from the
+    full content after indexing. ``user_id`` is required for user scope and
+    ``agent_id`` is required for agent scope. The tool rejects obvious secret-like
+    content; store credentials in a vault, not memory.
+    """
+    workspace_id = _validate_workspace_segment(workspace_id, "workspace_id")
+    project_id = _validate_workspace_segment(project_id, "project_id")
+    memory_type = _validate_workspace_memory_type(memory_type)
+    if not content.strip():
+        raise InvalidArgumentError("content must not be empty")
+    required_owner = _WORKSPACE_SCOPE_REQUIRES_OWNER[scope]
+    if required_owner == "user_id" and not user_id.strip():
+        raise InvalidArgumentError("user_id is required when scope='user'")
+    if required_owner == "agent_id" and not agent_id.strip():
+        raise InvalidArgumentError("agent_id is required when scope='agent'")
+    user_id = _validate_workspace_segment(user_id, "user_id") if user_id.strip() else ""
+    agent_id = _validate_workspace_segment(agent_id, "agent_id") if agent_id.strip() else ""
+    _reject_secret_like_memory(content)
+
+    service = get_service()
+    ctx = _get_ctx()
+    directory = _workspace_memory_dir(
+        workspace_id, project_id, scope, user_id=user_id, agent_id=agent_id
+    )
+    slug = _slugify_memory_title(title, content)
+    uri = _resolve_mcp_workspace_uri(f"{directory}/{slug}.md", ctx)
+    document = _workspace_memory_document(
+        workspace_id=workspace_id,
+        project_id=project_id,
+        scope=scope,
+        memory_type=memory_type,
+        title=title or slug,
+        content=content,
+        tags=tags,
+        user_id=user_id,
+        agent_id=agent_id,
+    )
+    result = await service.fs.write(
+        uri=uri, content=document, ctx=ctx, mode="create", wait=wait, timeout=timeout
+    )
+    return {
+        "status": "ok",
+        "uri": result.get("uri", uri),
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "scope": scope,
+        "memory_type": memory_type,
+        "user_id": user_id or None,
+        "agent_id": agent_id or None,
+        "indexing": {
+            "semantic_status": result.get("semantic_status"),
+            "vector_status": result.get("vector_status"),
+        },
+    }
+
+
+@_mcp_error_results()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def workspace_memory_search(
+    workspace_id: str,
+    project_id: str,
+    query: str,
+    scope: Optional[Literal["project", "user", "agent"]] = None,
+    user_id: str = "",
+    agent_id: str = "",
+    limit: Annotated[int, Field(ge=1, le=50)] = 10,
+    min_score: float = 0.35,
+    detail: Literal["abstract", "overview", "full"] = "overview",
+    read_content: bool = False,
+) -> dict[str, Any]:
+    """Search durable memories inside one workspace/project.
+
+    Omit ``scope`` to search all project, user, and agent memories for the
+    project. When ``scope`` is ``user`` or ``agent``, pass the matching
+    ``user_id`` or ``agent_id`` to narrow to one owner.
+    """
+    workspace_id = _validate_workspace_segment(workspace_id, "workspace_id")
+    project_id = _validate_workspace_segment(project_id, "project_id")
+    if not query.strip():
+        raise InvalidArgumentError("query must not be empty")
+
+    ctx = _get_ctx()
+    service = get_service()
+    if scope:
+        target_uri = _workspace_memory_dir(
+            workspace_id, project_id, scope, user_id=user_id, agent_id=agent_id
+        )
+    else:
+        target_uri = f"{_workspace_project_root(workspace_id, project_id)}/memories"
+    resolved_target = _resolve_mcp_workspace_uri(target_uri, ctx)
+    result = await service.search.find(
+        query=query,
+        ctx=ctx,
+        target_uri=resolved_target,
+        limit=limit,
+        score_threshold=min_score,
+        filter=_resolve_context_type_filter("resource"),
+    )
+    items = _context_items(result, force_type="memory")
+    await _apply_context_detail(
+        items,
+        service=service,
+        ctx=ctx,
+        detail="full" if read_content else detail,
+    )
+    return {
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "scope": scope or "all",
+        "detail": "full" if read_content else detail,
+        "target_uri": resolved_target,
+        "items": items,
+    }
+
+
+@_mcp_error_results()
+@mcp.tool(annotations=_DESTRUCTIVE_TOOL_ANNOTATIONS)
+async def workspace_session_commit(
+    workspace_id: str,
+    project_id: str,
+    session_id: str,
+    messages: List[WorkspaceSessionMessage],
+    company_id: str = "",
+    user_id: str = "",
+    agent_id: str = "",
+    task_id: str = "",
+    task_history: Optional[Dict[str, Any]] = None,
+    keep_recent_count: Annotated[int, Field(ge=0, le=200)] = 0,
+    extract_self: bool = True,
+    extract_peer: bool = True,
+) -> dict[str, Any]:
+    """Commit a LibreFang task transcript into native OpenViking session memory.
+
+    This is the native-first bridge for multi-agent runtimes. LibreFang should
+    call it when a task/session finishes and pass the conversation messages plus
+    optional structured task history. OpenViking stores the transcript in native
+    ``sessions/``, tags it with workspace/project/user/agent/task metadata, and
+    commits it so the native extraction pipeline can produce user memories,
+    peer-based project memories, trajectories, cases, and experiences according
+    to the server's memory policy and Agent Evolution configuration.
+    """
+    workspace_id = _validate_workspace_segment(workspace_id, "workspace_id")
+    project_id = _validate_workspace_segment(project_id, "project_id")
+    session_id = _validate_workspace_segment(session_id, "session_id")
+    company_id = _validate_workspace_segment(company_id, "company_id") if company_id.strip() else ""
+    user_id = _validate_workspace_segment(user_id, "user_id") if user_id.strip() else ""
+    agent_id = _validate_workspace_segment(agent_id, "agent_id") if agent_id.strip() else ""
+    task_id = _validate_workspace_segment(task_id, "task_id") if task_id.strip() else ""
+    if not messages and not task_history:
+        raise InvalidArgumentError("messages or task_history is required")
+
+    from openviking.message.part import TextPart
+
+    service = get_service()
+    ctx = _get_ctx()
+    peer_id = _workspace_native_peer_id(workspace_id, project_id, company_id=company_id)
+    event_tags = _workspace_event_tags(
+        workspace_id=workspace_id,
+        project_id=project_id,
+        company_id=company_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        task_id=task_id,
+    )
+    memory_policy = {
+        "self": {"enabled": extract_self},
+        "peer": {"enabled": extract_peer},
+    }
+
+    try:
+        session = await service.sessions.create(
+            ctx,
+            session_id=session_id,
+            memory_policy=memory_policy,
+            event_tags=event_tags,
+        )
+        created = True
+    except AlreadyExistsError:
+        session = await service.sessions.get(session_id, ctx)
+        created = False
+
+    message_specs: List[Dict[str, Any]] = []
+    for message in messages:
+        if not message.content.strip():
+            continue
+        message_specs.append(
+            {
+                "role": message.role,
+                "parts": [TextPart(text=message.content)],
+                "peer_id": peer_id,
+                "created_at": message.created_at,
+                "turn_id": message.turn_id,
+                "message_kind": message.message_kind,
+            }
+        )
+
+    if task_history:
+        task_payload = {
+            "workspace_id": workspace_id,
+            "project_id": project_id,
+            "company_id": company_id or None,
+            "user_id": user_id or None,
+            "agent_id": agent_id or None,
+            "task_id": task_id or None,
+            "task_history": task_history,
+        }
+        message_specs.append(
+            {
+                "role": "assistant",
+                "parts": [
+                    TextPart(
+                        text="LibreFang task history:\n"
+                        + json.dumps(task_payload, ensure_ascii=False, indent=2)
+                    )
+                ],
+                "peer_id": peer_id,
+                "message_kind": "checkpoint",
+            }
+        )
+
+    if message_specs:
+        add_messages = getattr(session, "add_messages_async", None)
+        if callable(add_messages):
+            await add_messages(message_specs)
+        else:
+            for spec in message_specs:
+                await session.add_message_async(
+                    spec["role"],
+                    spec["parts"],
+                    peer_id=spec.get("peer_id"),
+                    created_at=spec.get("created_at"),
+                    turn_id=spec.get("turn_id"),
+                    message_kind=spec.get("message_kind"),
+                )
+
+    commit = await service.sessions.commit_async(
+        session_id,
+        ctx,
+        keep_recent_count=keep_recent_count,
+        event_tags=event_tags,
+    )
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "session_created": created,
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "company_id": company_id or None,
+        "user_id": user_id or None,
+        "agent_id": agent_id or None,
+        "task_id": task_id or None,
+        "peer_id": peer_id,
+        "memory_policy": memory_policy,
+        "native_roots": {
+            "session": _resolve_mcp_workspace_uri(f"viking://~/sessions/{session_id}", ctx),
+            "project_peer_memories": _resolve_mcp_workspace_uri(
+                _workspace_native_peer_memory_root(
+                    workspace_id,
+                    project_id,
+                    company_id=company_id,
+                ),
+                ctx,
+            ),
+            "user_memories": _resolve_mcp_workspace_uri("viking://~/memories", ctx),
+            "experiences": _resolve_mcp_workspace_uri("viking://~/memories/experiences", ctx),
+        },
+        "event_tags": event_tags,
+        "messages_added": len(message_specs),
+        "commit": commit,
+    }
+
+
+@_mcp_error_results()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def workspace_context(
+    workspace_id: str,
+    project_id: str,
+    query: str,
+    company_id: str = "",
+    user_id: str = "",
+    agent_id: str = "",
+    project_limit: Annotated[int, Field(ge=0, le=20)] = 5,
+    user_limit: Annotated[int, Field(ge=0, le=20)] = 3,
+    agent_limit: Annotated[int, Field(ge=0, le=20)] = 3,
+    resource_limit: Annotated[int, Field(ge=0, le=20)] = 3,
+    skill_limit: Annotated[int, Field(ge=0, le=20)] = 2,
+    native_limit: Annotated[int, Field(ge=0, le=20)] = 3,
+    include_native: bool = False,
+    min_score: float = 0.35,
+    detail: Literal["abstract", "overview", "full"] = "overview",
+) -> dict[str, Any]:
+    """Return workspace/project context buckets for an MCP agent's task start.
+
+    LibreFang can call this before planning a task. The response separates
+    project, user, and agent memories, plus optional workspace resources and
+    workspace-local skill documents. When ``include_native`` is true, it also
+    searches OpenViking's native peer, user, and experience memory roots for the
+    same workspace/project mapping. Skill entries are ordinary files under
+    ``viking://~/workspaces/{workspace}/projects/{project}/skills``; install
+    first-class OpenViking skills with ``add_skill`` when shared skill lifecycle
+    management is needed.
+    """
+    workspace_id = _validate_workspace_segment(workspace_id, "workspace_id")
+    project_id = _validate_workspace_segment(project_id, "project_id")
+    if not query.strip():
+        raise InvalidArgumentError("query must not be empty")
+    company_id = _validate_workspace_segment(company_id, "company_id") if company_id.strip() else ""
+    user_id = _validate_workspace_segment(user_id, "user_id") if user_id.strip() else ""
+    agent_id = _validate_workspace_segment(agent_id, "agent_id") if agent_id.strip() else ""
+
+    ctx = _get_ctx()
+    service = get_service()
+
+    async def _find_bucket(
+        name: str,
+        target_uri: str,
+        limit: int,
+        context_type: SearchContextTypeInput,
+        item_type: Optional[str] = None,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        if limit <= 0:
+            return name, []
+        try:
+            result = await service.search.find(
+                query=query,
+                ctx=ctx,
+                target_uri=_resolve_mcp_workspace_uri(target_uri, ctx),
+                limit=limit,
+                score_threshold=min_score,
+                filter=_resolve_context_type_filter(context_type),
+            )
+        except NotFoundError:
+            return name, []
+        items = _context_items(result, force_type=item_type)
+        await _apply_context_detail(items, service=service, ctx=ctx, detail=detail)
+        return name, items
+
+    import asyncio
+
+    tasks = [
+        _find_bucket(
+            "project_memories",
+            _workspace_memory_dir(workspace_id, project_id, "project"),
+            project_limit,
+            "resource",
+            "memory",
+        ),
+        _find_bucket(
+            "resources",
+            _workspace_resource_dir(workspace_id, project_id),
+            resource_limit,
+            "resource",
+        ),
+        _find_bucket(
+            "skills",
+            _workspace_skill_dir(workspace_id, project_id),
+            skill_limit,
+            "resource",
+        ),
+    ]
+    empty_buckets: Dict[str, List[Dict[str, Any]]] = {}
+    if user_id:
+        tasks.append(
+            _find_bucket(
+                "user_memories",
+                _workspace_memory_dir(workspace_id, project_id, "user", user_id=user_id),
+                user_limit,
+                "resource",
+                "memory",
+            )
+        )
+    else:
+        empty_buckets["user_memories"] = []
+    if agent_id:
+        tasks.append(
+            _find_bucket(
+                "agent_memories",
+                _workspace_memory_dir(workspace_id, project_id, "agent", agent_id=agent_id),
+                agent_limit,
+                "resource",
+                "memory",
+            )
+        )
+    else:
+        empty_buckets["agent_memories"] = []
+    if include_native:
+        tasks.extend(
+            [
+                _find_bucket(
+                    "native_project_memories",
+                    _workspace_native_peer_memory_root(
+                        workspace_id,
+                        project_id,
+                        company_id=company_id,
+                    ),
+                    native_limit,
+                    "memory",
+                ),
+                _find_bucket(
+                    "native_user_memories",
+                    "viking://~/memories",
+                    native_limit,
+                    "memory",
+                ),
+                _find_bucket(
+                    "native_experiences",
+                    "viking://~/memories/experiences",
+                    native_limit,
+                    "memory",
+                ),
+            ]
+        )
+    else:
+        empty_buckets.update(
+            {
+                "native_project_memories": [],
+                "native_user_memories": [],
+                "native_experiences": [],
+            }
+        )
+
+    buckets = {**dict(await asyncio.gather(*tasks)), **empty_buckets}
+    peer_id = _workspace_native_peer_id(workspace_id, project_id, company_id=company_id)
+    return {
+        "workspace_id": workspace_id,
+        "project_id": project_id,
+        "company_id": company_id or None,
+        "query": query,
+        "detail": detail,
+        "native": {
+            "enabled": include_native,
+            "peer_id": peer_id,
+        },
+        "roots": {
+            "project": _resolve_mcp_workspace_uri(_workspace_project_root(workspace_id, project_id), ctx),
+            "memories": _resolve_mcp_workspace_uri(
+                f"{_workspace_project_root(workspace_id, project_id)}/memories", ctx
+            ),
+            "resources": _resolve_mcp_workspace_uri(_workspace_resource_dir(workspace_id, project_id), ctx),
+            "skills": _resolve_mcp_workspace_uri(_workspace_skill_dir(workspace_id, project_id), ctx),
+            "native_project_peer_memories": _resolve_mcp_workspace_uri(
+                _workspace_native_peer_memory_root(
+                    workspace_id,
+                    project_id,
+                    company_id=company_id,
+                ),
+                ctx,
+            ),
+            "native_user_memories": _resolve_mcp_workspace_uri("viking://~/memories", ctx),
+            "native_experiences": _resolve_mcp_workspace_uri(
+                "viking://~/memories/experiences",
+                ctx,
+            ),
+        },
+        **buckets,
+    }
 
 
 # -- write -----------------------------------------------------------------
