@@ -559,7 +559,7 @@ jobs:
             -v --tb=short -m cli_remote \
             --html=cli-test-report.html --self-contained-html
       - name: Upload test reports
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: api-test-reports-${{ matrix.os }}-${{ github.run_id }}
